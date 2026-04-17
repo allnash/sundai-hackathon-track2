@@ -5,8 +5,8 @@ from pathlib import Path
 
 from huggingface_hub import snapshot_download
 
-PUBLIC_REPO = "samuelt0207/cuda-challenge-flux-dump"
-HOLDOUT_REPO = "samuelt0207/cuda-challenge-flux-dump-holdout" # private for now
+PUBLIC_REPO = "nunchaku-ai/cuda-challenge-flux-dump"
+HOLDOUT_REPO = "nunchaku-ai/cuda-challenge-flux-dump-holdout" # private for now
 
 
 def main():

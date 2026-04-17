@@ -14,7 +14,7 @@ This creates a conda environment `cuda-challenge` with Python 3.11, PyTorch, nin
 python download_data.py
 ```
 
-Pulls ~390 MB of activation/weight tensors from [`samuelt0207/cuda-challenge-flux-dump`](https://huggingface.co/datasets/samuelt0207/cuda-challenge-flux-dump) into `flux_dump/`. `./benchmark.sh` will also do this automatically on first run.
+Pulls ~390 MB of activation/weight tensors from [`nunchaku-ai/cuda-challenge-flux-dump`](https://huggingface.co/datasets/nunchaku-ai/cuda-challenge-flux-dump) into `flux_dump/`. `./benchmark.sh` will also do this automatically on first run.
 
 The 4 target GEMM shapes:
 
