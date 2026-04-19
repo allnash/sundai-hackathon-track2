@@ -1,15 +1,8 @@
 /**
- * High-performance INT4 GEMM Kernel — targeting peak tensor core utilization
+ * Optimized INT4 GEMM Kernel v4
  *
- * Key optimizations:
- *   1. BLOCK_K=128: 2 quantization groups per K-tile → halves __syncthreads count
- *   2. BLOCK_N=64: smaller accumulators (32 regs) → 3-4 blocks/SM → 24-32 warps
- *   3. No bounds checking: all benchmark shapes are exact tile multiples
- *   4. Non-predicated cp.async.cg: minimal instruction overhead, L2-only caching
- *   5. Precomputed sa*sb scale products: halves FP32 multiply count
- *   6. Vectorized __half2 epilogue stores
- *   7. torch::empty output (no memset)
- *   8. 3 cp.async calls per thread per K-tile (2 for A, 1 for B)
+ * Key: SMEM_STRIDE=48 gives ZERO bank conflicts (proven by reference at 58 TOPs).
+ * BLOCK_N=64 gives 4 blocks/SM = 32 warps (2x reference occupancy).
  */
 
 #include <cuda_fp16.h>
@@ -78,18 +71,18 @@ std::vector<torch::Tensor> quantize_int4_custom(torch::Tensor input, int group_s
     return {output, scales};
 }
 
-// ====================== HIGH-PERFORMANCE INT4 GEMM ======================
+// ====================== GEMM ======================
 
 static constexpr int BM = 128;
-static constexpr int BN = 64;
-static constexpr int BK = 128;        // 2 quantization groups per K-tile (for g=64)
+static constexpr int BN = 64;       // Half of reference → 2x occupancy
+static constexpr int BK = 64;       // = group_size, one group per K-tile
 static constexpr int WS = 32;
 static constexpr int NW = 8;
-static constexpr int WM = BM / NW;    // 16 rows per warp
-static constexpr int TN = BN / 16;    // 4 N-tiles per warp
-static constexpr int SS = BK / 2;     // 64 bytes per smem row (no padding needed for 16B alignment)
+static constexpr int WM = BM / NW;  // 16
+static constexpr int TN = BN / 16;  // 4
+static constexpr int SS = BK / 2 + 16;  // 48 bytes — ZERO bank conflicts (proven)
 
-// ---- MMA m16n8k64 INT4 → INT32 ----
+// ---- MMA m16n8k64 ----
 __device__ __forceinline__ void mma_s4(uint4 a, uint2 b, int (&c)[4]) {
 #if __CUDA_ARCH__ >= 800
     asm volatile(
@@ -110,10 +103,14 @@ __device__ __forceinline__ void mma_s4(uint4 a, uint2 b, int (&c)[4]) {
 #endif
 }
 
-// ---- cp.async: non-predicated (all accesses guaranteed in-bounds) ----
-__device__ __forceinline__ void cp_async_16(void *dst, const void *src) {
+// ---- cp.async ----
+__device__ __forceinline__ void cp_async_16(void *dst, const void *src, bool pred) {
     unsigned s = __cvta_generic_to_shared(dst);
-    asm volatile("cp.async.cg.shared.global [%0],[%1],16;\n" :: "r"(s),"l"(src));
+    asm volatile(
+        "{ .reg .pred p; setp.ne.b32 p,%2,0;\n"
+        "  @p cp.async.cg.shared.global [%0],[%1],16;\n"
+        "  @!p st.shared.v4.u32 [%0],{0,0,0,0}; }\n"
+        :: "r"(s),"l"(src),"r"((int)pred));
 }
 __device__ __forceinline__ void cp_commit()  { asm volatile("cp.async.commit_group;\n"); }
 __device__ __forceinline__ void cp_wait_0()  { asm volatile("cp.async.wait_group 0;\n"); }
@@ -140,8 +137,8 @@ __device__ __forceinline__ uint2 load_b_frag(const uint8_t *base, int stride) {
     return b;
 }
 
-// ---- Main GEMM kernel ----
-__global__ void __launch_bounds__(256, 3)
+// ---- GEMM kernel ----
+__global__ void __launch_bounds__(256, 4)
 gemm_int4_kernel(
     const uint8_t *__restrict__ A,
     const uint8_t *__restrict__ B,
@@ -158,17 +155,15 @@ gemm_int4_kernel(
     const int halfK = K / 2;
     const int ng = K / group_size;
     const int nkt = K / BK;
-    const int gpt = BK / group_size;  // groups per K-tile (2 for g=64, 1 for g=128)
-    const int gs_half = group_size / 2;  // byte offset per sub-group
 
-    // ---- Double-buffered shared memory ----
+    // Double-buffered shared memory
     extern __shared__ uint8_t smem[];
-    const int tA = BM * SS;   // 8192
-    const int tB = BN * SS;   // 4096
+    const int tA = BM * SS;   // 6144
+    const int tB = BN * SS;   // 3072
     uint8_t *sA[2] = {smem, smem + tA + tB};
     uint8_t *sB[2] = {smem + tA, smem + tA + tB + tA};
 
-    // ---- FP32 accumulators (32 registers) ----
+    // Accumulators (32 float regs)
     float acc[TN][2][4];
     #pragma unroll
     for (int j = 0; j < TN; j++)
@@ -176,118 +171,107 @@ gemm_int4_kernel(
         for (int h = 0; h < 2; h++)
             acc[j][h][0] = acc[j][h][1] = acc[j][h][2] = acc[j][h][3] = 0.f;
 
-    // ---- Tile loader: 3 cp.async per thread (2 A + 1 B) ----
+    // Tile loader
     auto load_tile = [&](int kt, int s) {
         int kb = kt * (BK / 2);
 
-        // A: 128 rows × 4 chunks(16B) = 512 calls → 2 per thread
-        #pragma unroll
-        for (int i = 0; i < 2; i++) {
-            int idx = i * 256 + tid;
-            int row = idx >> 2, chunk = idx & 3;
-            cp_async_16(sA[s] + row * SS + chunk * 16,
-                        A + (size_t)(bm + row) * halfK + kb + chunk * 16);
+        // A tile: 128 rows × 2 halves = 256 calls, all 256 threads
+        {
+            int row = tid / 2, half_idx = tid % 2;
+            bool p = (bm + row < M) && (kb + half_idx * 16 < halfK);
+            cp_async_16(sA[s] + row * SS + half_idx * 16,
+                        A + (size_t)(bm + row) * halfK + kb + half_idx * 16, p);
         }
 
-        // B: 64 rows × 4 chunks = 256 calls → 1 per thread
-        {
-            int row = tid >> 2, chunk = tid & 3;
-            cp_async_16(sB[s] + row * SS + chunk * 16,
-                        B + (size_t)(bn + row) * halfK + kb + chunk * 16);
+        // B tile: 64 rows × 2 halves = 128 calls, first 128 threads
+        if (tid < BN * 2) {
+            int row = tid / 2, half_idx = tid % 2;
+            bool p = (bn + row < N) && (kb + half_idx * 16 < halfK);
+            cp_async_16(sB[s] + row * SS + half_idx * 16,
+                        B + (size_t)(bn + row) * halfK + kb + half_idx * 16, p);
         }
 
         cp_commit();
     };
 
     // Prefetch first tile
-    load_tile(0, 0);
+    if (nkt > 0) load_tile(0, 0);
 
-    // Precompute warp row indices
+    // Precompute row indices
     const int m_lo = bm + wid * WM + lid / 4;
     const int m_hi = m_lo + 8;
 
-    // ---- Main K-loop ----
+    // Main K-loop
     for (int kt = 0; kt < nkt; kt++) {
         int s = kt & 1;
 
-        // Prefetch next K-tile
         if (kt + 1 < nkt) load_tile(kt + 1, (kt + 1) & 1);
-
-        // Wait for current tile
         if (kt + 1 < nkt) cp_wait_1(); else cp_wait_0();
         __syncthreads();
 
-        // Base group index for this K-tile
-        int base_g = (kt * BK) / group_size;
+        int g = (kt * BK) / group_size;
 
-        // Process each quantization group within this K-tile
-        #pragma unroll 2
-        for (int sub = 0; sub < gpt; sub++) {
-            int g = base_g + sub;
-            int foff = sub * gs_half;  // fragment byte offset (0 or 32 for g=64)
+        // A scales (L1 cached, 2 unique per warp)
+        float sa_lo = (m_lo < M) ? __half2float(scales_A[m_lo * ng + g]) : 0.f;
+        float sa_hi = (m_hi < M) ? __half2float(scales_A[m_hi * ng + g]) : 0.f;
 
-            // Activation scales (L1/L2 cached — only 2 unique per warp)
-            float sa_lo = __half2float(scales_A[m_lo * ng + g]);
-            float sa_hi = __half2float(scales_A[m_hi * ng + g]);
+        // A fragment (reused across N-tiles)
+        uint4 af = load_a_frag(sA[s] + wid * WM * SS, SS);
 
-            // A-fragment (reused across all N-tiles)
-            uint4 af = load_a_frag(sA[s] + wid * WM * SS + foff, SS);
+        #pragma unroll
+        for (int nt = 0; nt < TN; nt++) {
+            int noff = nt * 16;
 
-            // Process each 16-column N-tile
-            #pragma unroll
-            for (int nt = 0; nt < TN; nt++) {
-                int noff = nt * 16;
+            uint2 bf0 = load_b_frag(sB[s] + noff * SS, SS);
+            uint2 bf1 = load_b_frag(sB[s] + (noff + 8) * SS, SS);
 
-                // B-fragments
-                uint2 bf0 = load_b_frag(sB[s] + noff * SS + foff, SS);
-                uint2 bf1 = load_b_frag(sB[s] + (noff + 8) * SS + foff, SS);
+            int p0[4] = {0,0,0,0}, p1[4] = {0,0,0,0};
+            mma_s4(af, bf0, p0);
+            mma_s4(af, bf1, p1);
 
-                // INT32 MMA
-                int p0[4] = {0,0,0,0}, p1[4] = {0,0,0,0};
-                mma_s4(af, bf0, p0);
-                mma_s4(af, bf1, p1);
+            // B scales (L1 cached)
+            int c0 = bn + noff + (lid % 4) * 2;
+            int c1 = c0 + 1, c2 = c0 + 8, c3 = c2 + 1;
+            float sb0 = (c0 < N) ? __half2float(scales_B[c0 * ng + g]) : 0.f;
+            float sb1 = (c1 < N) ? __half2float(scales_B[c1 * ng + g]) : 0.f;
+            float sb2 = (c2 < N) ? __half2float(scales_B[c2 * ng + g]) : 0.f;
+            float sb3 = (c3 < N) ? __half2float(scales_B[c3 * ng + g]) : 0.f;
 
-                // B scales (L1 cached — 4 unique per N-tile)
-                int ca = bn + noff + (lid & 3) * 2;
-                float sb0 = __half2float(scales_B[ca       * ng + g]);
-                float sb1 = __half2float(scales_B[(ca + 1) * ng + g]);
-                float sb2 = __half2float(scales_B[(ca + 8) * ng + g]);
-                float sb3 = __half2float(scales_B[(ca + 9) * ng + g]);
+            // Precomputed scale products
+            float s00 = sa_lo * sb0, s01 = sa_lo * sb1;
+            float s10 = sa_hi * sb0, s11 = sa_hi * sb1;
+            float s20 = sa_lo * sb2, s21 = sa_lo * sb3;
+            float s30 = sa_hi * sb2, s31 = sa_hi * sb3;
 
-                // Precomputed scale products (halves multiply count)
-                float s00 = sa_lo * sb0, s01 = sa_lo * sb1;
-                float s10 = sa_hi * sb0, s11 = sa_hi * sb1;
-                float s20 = sa_lo * sb2, s21 = sa_lo * sb3;
-                float s30 = sa_hi * sb2, s31 = sa_hi * sb3;
-
-                // Scale and accumulate
-                acc[nt][0][0] += (float)p0[0] * s00;
-                acc[nt][0][1] += (float)p0[1] * s01;
-                acc[nt][0][2] += (float)p0[2] * s10;
-                acc[nt][0][3] += (float)p0[3] * s11;
-                acc[nt][1][0] += (float)p1[0] * s20;
-                acc[nt][1][1] += (float)p1[1] * s21;
-                acc[nt][1][2] += (float)p1[2] * s30;
-                acc[nt][1][3] += (float)p1[3] * s31;
-            }
+            acc[nt][0][0] += (float)p0[0] * s00;
+            acc[nt][0][1] += (float)p0[1] * s01;
+            acc[nt][0][2] += (float)p0[2] * s10;
+            acc[nt][0][3] += (float)p0[3] * s11;
+            acc[nt][1][0] += (float)p1[0] * s20;
+            acc[nt][1][1] += (float)p1[1] * s21;
+            acc[nt][1][2] += (float)p1[2] * s30;
+            acc[nt][1][3] += (float)p1[3] * s31;
         }
         __syncthreads();
     }
 
-    // ---- Epilogue: vectorized __half2 stores (no bounds checks) ----
+    // Epilogue
     #pragma unroll
     for (int nt = 0; nt < TN; nt++) {
-        int c0 = bn + nt * 16 + (lid & 3) * 2;
-        int c2 = c0 + 8;
-
-        *((__half2*)&C[m_lo * N + c0]) = __halves2half2(
-            __float2half(acc[nt][0][0]), __float2half(acc[nt][0][1]));
-        *((__half2*)&C[m_lo * N + c2]) = __halves2half2(
-            __float2half(acc[nt][1][0]), __float2half(acc[nt][1][1]));
-        *((__half2*)&C[m_hi * N + c0]) = __halves2half2(
-            __float2half(acc[nt][0][2]), __float2half(acc[nt][0][3]));
-        *((__half2*)&C[m_hi * N + c2]) = __halves2half2(
-            __float2half(acc[nt][1][2]), __float2half(acc[nt][1][3]));
+        int c0 = bn + nt * 16 + (lid % 4) * 2;
+        int c1 = c0 + 1, c2 = c0 + 8, c3 = c2 + 1;
+        if (m_lo < M) {
+            if (c0 < N) C[m_lo * N + c0] = __float2half(acc[nt][0][0]);
+            if (c1 < N) C[m_lo * N + c1] = __float2half(acc[nt][0][1]);
+            if (c2 < N) C[m_lo * N + c2] = __float2half(acc[nt][1][0]);
+            if (c3 < N) C[m_lo * N + c3] = __float2half(acc[nt][1][1]);
+        }
+        if (m_hi < M) {
+            if (c0 < N) C[m_hi * N + c0] = __float2half(acc[nt][0][2]);
+            if (c1 < N) C[m_hi * N + c1] = __float2half(acc[nt][0][3]);
+            if (c2 < N) C[m_hi * N + c2] = __float2half(acc[nt][1][2]);
+            if (c3 < N) C[m_hi * N + c3] = __float2half(acc[nt][1][3]);
+        }
     }
 }
 
@@ -299,25 +283,18 @@ torch::Tensor gemm_int4_custom(
     TORCH_CHECK(A_packed.is_cuda() && B_packed.is_cuda());
     TORCH_CHECK(A_packed.dtype() == torch::kUInt8);
     int M = A_packed.size(0), K = A_packed.size(1) * 2, N = B_packed.size(0);
-
-    // All benchmark shapes are exact multiples — enables bounds-check-free kernel
-    TORCH_CHECK(M % BM == 0, "M must be multiple of ", BM);
-    TORCH_CHECK(N % BN == 0, "N must be multiple of ", BN);
     TORCH_CHECK(K % BK == 0, "K must be multiple of ", BK);
-    TORCH_CHECK(group_size <= BK && BK % group_size == 0,
-                "group_size must divide BK=", BK);
+    TORCH_CHECK(group_size <= BK && BK % group_size == 0);
 
     auto C = torch::empty({M, N},
         torch::TensorOptions().dtype(torch::kHalf).device(A_packed.device()));
 
-    dim3 grid(N / BN, M / BM);
-    dim3 block(WS * NW);  // 256
+    dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
+    dim3 block(WS * NW);
+    int smem = 2 * (BM * SS + BN * SS);  // 18432 bytes
 
-    // Shared memory: double-buffered data tiles
-    int smem = 2 * (BM * SS + BN * SS);  // 2*(8192+4096) = 24576 bytes
-
-    static std::once_flag config_flag;
-    std::call_once(config_flag, [&]() {
+    static std::once_flag flag;
+    std::call_once(flag, [&]() {
         cudaFuncSetAttribute(gemm_int4_kernel,
                              cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
         cudaFuncSetAttribute(gemm_int4_kernel,
