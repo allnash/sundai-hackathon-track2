@@ -451,14 +451,6 @@ __global__ void gemm_direct_kernel(
             if (tid < BN) ssb[s ^ 1][tid] = scales_B[(bn * BN + tid) * num_groups_B + bg + 1];
         }
 
-        // Pre-read B scales for all N-tiles (constant within B-group)
-        half2 sb01_all[NT], sb23_all[NT];
-        #pragma unroll
-        for (int nt = 0; nt < NT; nt++) {
-            sb01_all[nt] = *reinterpret_cast<const half2*>(&ssb[s][nt * 16 + (lane % 4) * 2]);
-            sb23_all[nt] = *reinterpret_cast<const half2*>(&ssb[s][nt * 16 + (lane % 4) * 2 + 8]);
-        }
-
         // Inner loop: K-tiles within this B-scale group
         for (int sub = 0; sub < b_scale_stride; sub++) {
             const int kt = bg * b_scale_stride + sub;
@@ -474,7 +466,7 @@ __global__ void gemm_direct_kernel(
             const half2 sa2 = __halves2half2(sa2_s, sa2_s);
             const half2 sa3 = __halves2half2(sa3_s, sa3_s);
 
-            // N-tile compute loop
+            // N-tile compute loop (A-fragments already in registers from prefetch)
             #pragma unroll
             for (int nt = 0; nt < NT; nt++) {
                 uint4 bf = B[b_base + (size_t)kt * b_stride + nt * WS];
@@ -486,11 +478,14 @@ __global__ void gemm_direct_kernel(
                 mma_s4(af1, uint2{bf.x, bf.y}, q0);
                 mma_s4(af1, uint2{bf.z, bf.w}, q1);
 
-                // Scale products using pre-read B scales
-                const half2 s00 = __hmul2(sa0, sb01_all[nt]), s01 = __hmul2(sa1, sb01_all[nt]);
-                const half2 s02 = __hmul2(sa0, sb23_all[nt]), s03 = __hmul2(sa1, sb23_all[nt]);
-                const half2 s10 = __hmul2(sa2, sb01_all[nt]), s11 = __hmul2(sa3, sb01_all[nt]);
-                const half2 s12 = __hmul2(sa2, sb23_all[nt]), s13 = __hmul2(sa3, sb23_all[nt]);
+                // B scales from shared memory (constant within B-group)
+                const half2 sb01 = *reinterpret_cast<const half2*>(&ssb[s][nt * 16 + (lane % 4) * 2]);
+                const half2 sb23 = *reinterpret_cast<const half2*>(&ssb[s][nt * 16 + (lane % 4) * 2 + 8]);
+
+                const half2 s00 = __hmul2(sa0, sb01), s01 = __hmul2(sa1, sb01);
+                const half2 s02 = __hmul2(sa0, sb23), s03 = __hmul2(sa1, sb23);
+                const half2 s10 = __hmul2(sa2, sb01), s11 = __hmul2(sa3, sb01);
+                const half2 s12 = __hmul2(sa2, sb23), s13 = __hmul2(sa3, sb23);
 
                 acc[0][nt][0] = __hfma2(__floats2half2_rn((float)p0[0], (float)p0[1]), s00, acc[0][nt][0]);
                 acc[0][nt][1] = __hfma2(__floats2half2_rn((float)p0[2], (float)p0[3]), s01, acc[0][nt][1]);
