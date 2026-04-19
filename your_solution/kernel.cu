@@ -469,7 +469,7 @@ __global__ void gemm_direct_kernel(
             // N-tile compute loop (A-fragments already in registers from prefetch)
             #pragma unroll
             for (int nt = 0; nt < NT; nt++) {
-                const uint4 bf = __ldg(&B[b_base + (size_t)kt * b_stride + nt * WS]);
+                uint4 bf = B[b_base + (size_t)kt * b_stride + nt * WS];
 
                 int p0[4] = {0,0,0,0}, p1[4] = {0,0,0,0};
                 int q0[4] = {0,0,0,0}, q1[4] = {0,0,0,0};
