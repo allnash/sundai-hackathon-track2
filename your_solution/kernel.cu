@@ -291,11 +291,16 @@ __global__ void gemm_direct_kernel(
         const half2 sa2 = __halves2half2(ssa[s][warp * WM + row + 16],ssa[s][warp * WM + row + 16]);
         const half2 sa3 = __halves2half2(ssa[s][warp * WM + row + 24],ssa[s][warp * WM + row + 24]);
 
-        // N-tile compute loop (A-fragments already in registers from prefetch)
+        // N-tile compute loop with B-fragment prefetching
+        // Load first B fragment ahead of the loop
+        const size_t b_kt_base = b_base + (size_t)kt * b_stride;
+        uint4 bf = B[b_kt_base];
+
         #pragma unroll
         for (int nt = 0; nt < NT; nt++) {
-            // Load B fragment
-            uint4 bf = B[b_base + (size_t)kt * b_stride + nt * WS];
+            // Prefetch NEXT B fragment while computing with current
+            uint4 bf_next;
+            if (nt + 1 < NT) bf_next = B[b_kt_base + (nt + 1) * WS];
 
             // 4 MMAs
             int p0[4] = {0,0,0,0}, p1[4] = {0,0,0,0};
@@ -325,6 +330,8 @@ __global__ void gemm_direct_kernel(
             acc[1][nt][1] = __hfma2(__floats2half2_rn((float)q0[2], (float)q0[3]), s11, acc[1][nt][1]);
             acc[1][nt][2] = __hfma2(__floats2half2_rn((float)q1[0], (float)q1[1]), s12, acc[1][nt][2]);
             acc[1][nt][3] = __hfma2(__floats2half2_rn((float)q1[2], (float)q1[3]), s13, acc[1][nt][3]);
+
+            bf = bf_next;  // Advance to prefetched fragment
         }
 
         // Prefetch NEXT K-tile's A-fragments (overlap global loads with sync)
