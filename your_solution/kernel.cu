@@ -218,12 +218,14 @@ __global__ void repack_wgt_kernel(
     }
 }
 
-// ======================== DIRECT GEMM KERNEL v2 ========================
+// ======================== DIRECT GEMM KERNEL v3 ========================
 //
-// Optimizations over v1:
-//   1. Double-buffered scales → 1 __syncthreads per K-tile (was 2)
-//   2. A-fragment prefetching → overlap global loads with sync barrier
-//   3. B-fragment prefetching within N-tile loop
+// Key improvements over v2:
+//   1. __shfl_sync for A scales (no shared memory or sync needed for A)
+//   2. B-group outer loop: B scales only reload at group boundaries
+//   3. Double-buffered B scales across groups
+//   4. A-fragment prefetching across K-tiles
+//   Syncs reduced from nkt to num_groups_B+1 (e.g., 192→9 for ff_down)
 
 __global__ void gemm_direct_kernel(
     const uint4* __restrict__ A,
@@ -231,7 +233,7 @@ __global__ void gemm_direct_kernel(
     const half*  __restrict__ scales_A,
     const half*  __restrict__ scales_B,
     half*        __restrict__ C,
-    int M, int N, int nkt)
+    int M, int N, int nkt, int num_groups_B)
 {
     const int bn = blockIdx.x;
     const int bm = blockIdx.y;
@@ -241,8 +243,7 @@ __global__ void gemm_direct_kernel(
     const int m_base = bm * BM + warp * WM;
     const int row = lane / 4;
 
-    // Double-buffered scales in shared memory (~1.5KB total)
-    __shared__ half ssa[2][BM];
+    // Only B scales in shared memory (double-buffered, ~512B)
     __shared__ half ssb[2][BN];
 
     // half2 accumulators
@@ -260,80 +261,86 @@ __global__ void gemm_direct_kernel(
     // Precompute A-fragment base addresses for this warp
     const int a_base0 = (((bm * nkt) * NW + warp) * AT + 0) * WS + lane;
     const int a_base1 = (((bm * nkt) * NW + warp) * AT + 1) * WS + lane;
-    const int a_stride = NW * AT * WS;  // stride per K-tile
+    const int a_stride = NW * AT * WS;
 
     const int b_base = (bn * nkt) * NT * WS + lane;
-    const int b_stride = NT * WS;  // stride per K-tile
+    const int b_stride = NT * WS;
 
-    // Prefetch first K-tile's scales
-    if (tid < BM) ssa[0][tid] = scales_A[(bm * BM + tid) * nkt + 0];
-    if (tid < BN) ssb[0][tid] = scales_B[(bn * BN + tid) * nkt + 0];
+    const int b_scale_stride = nkt / num_groups_B;  // K-tiles per B-scale group
 
-    // Prefetch first K-tile's A-fragments (overlap with scale sync)
+    // Pre-load first B-scale group
+    if (tid < BN) ssb[0][tid] = scales_B[(bn * BN + tid) * num_groups_B + 0];
+
+    // Prefetch first K-tile's A-fragments
     uint4 af0 = A[a_base0];
     uint4 af1 = A[a_base1];
 
     __syncthreads();
 
-    // K-loop with double-buffered scales and prefetched fragments
-    for (int kt = 0; kt < nkt; kt++) {
-        const int s = kt & 1;
+    // Outer loop: B-scale groups
+    for (int bg = 0; bg < num_groups_B; bg++) {
+        const int s = bg & 1;
 
-        // Prefetch NEXT K-tile's scales into alternate buffer (overlaps with compute)
-        if (kt + 1 < nkt) {
-            if (tid < BM) ssa[s ^ 1][tid] = scales_A[(bm * BM + tid) * nkt + kt + 1];
-            if (tid < BN) ssb[s ^ 1][tid] = scales_B[(bn * BN + tid) * nkt + kt + 1];
+        // Pre-load NEXT B-scale group into alternate buffer (overlaps with compute)
+        if (bg + 1 < num_groups_B) {
+            if (tid < BN) ssb[s ^ 1][tid] = scales_B[(bn * BN + tid) * num_groups_B + bg + 1];
         }
 
-        // Read current scales from shared memory (buffer s)
-        const half2 sa0 = __halves2half2(ssa[s][warp * WM + row],     ssa[s][warp * WM + row]);
-        const half2 sa1 = __halves2half2(ssa[s][warp * WM + row + 8], ssa[s][warp * WM + row + 8]);
-        const half2 sa2 = __halves2half2(ssa[s][warp * WM + row + 16],ssa[s][warp * WM + row + 16]);
-        const half2 sa3 = __halves2half2(ssa[s][warp * WM + row + 24],ssa[s][warp * WM + row + 24]);
+        // Inner loop: K-tiles within this B-scale group
+        for (int sub = 0; sub < b_scale_stride; sub++) {
+            const int kt = bg * b_scale_stride + sub;
 
-        // N-tile compute loop (A-fragments already in registers from prefetch)
-        #pragma unroll
-        for (int nt = 0; nt < NT; nt++) {
-            // Load B fragment
-            uint4 bf = B[b_base + (size_t)kt * b_stride + nt * WS];
+            // A scales via __shfl_sync — no shared memory or __syncthreads needed
+            const half scale_lane = scales_A[(m_base + lane) * nkt + kt];
+            const half sa0_s = __shfl_sync(0xffffffff, scale_lane, row);
+            const half sa1_s = __shfl_sync(0xffffffff, scale_lane, row + 8);
+            const half sa2_s = __shfl_sync(0xffffffff, scale_lane, row + 16);
+            const half sa3_s = __shfl_sync(0xffffffff, scale_lane, row + 24);
+            const half2 sa0 = __halves2half2(sa0_s, sa0_s);
+            const half2 sa1 = __halves2half2(sa1_s, sa1_s);
+            const half2 sa2 = __halves2half2(sa2_s, sa2_s);
+            const half2 sa3 = __halves2half2(sa3_s, sa3_s);
 
-            // 4 MMAs
-            int p0[4] = {0,0,0,0}, p1[4] = {0,0,0,0};
-            int q0[4] = {0,0,0,0}, q1[4] = {0,0,0,0};
-            mma_s4(af0, uint2{bf.x, bf.y}, p0);
-            mma_s4(af0, uint2{bf.z, bf.w}, p1);
-            mma_s4(af1, uint2{bf.x, bf.y}, q0);
-            mma_s4(af1, uint2{bf.z, bf.w}, q1);
+            // N-tile compute loop (A-fragments already in registers from prefetch)
+            #pragma unroll
+            for (int nt = 0; nt < NT; nt++) {
+                uint4 bf = B[b_base + (size_t)kt * b_stride + nt * WS];
 
-            // Weight scales
-            const half2 sb01 = *reinterpret_cast<const half2*>(&ssb[s][nt * 16 + (lane % 4) * 2]);
-            const half2 sb23 = *reinterpret_cast<const half2*>(&ssb[s][nt * 16 + (lane % 4) * 2 + 8]);
+                int p0[4] = {0,0,0,0}, p1[4] = {0,0,0,0};
+                int q0[4] = {0,0,0,0}, q1[4] = {0,0,0,0};
+                mma_s4(af0, uint2{bf.x, bf.y}, p0);
+                mma_s4(af0, uint2{bf.z, bf.w}, p1);
+                mma_s4(af1, uint2{bf.x, bf.y}, q0);
+                mma_s4(af1, uint2{bf.z, bf.w}, q1);
 
-            // Scale products
-            const half2 s00 = __hmul2(sa0, sb01), s01 = __hmul2(sa1, sb01);
-            const half2 s02 = __hmul2(sa0, sb23), s03 = __hmul2(sa1, sb23);
-            const half2 s10 = __hmul2(sa2, sb01), s11 = __hmul2(sa3, sb01);
-            const half2 s12 = __hmul2(sa2, sb23), s13 = __hmul2(sa3, sb23);
+                // B scales from shared memory (constant within B-group)
+                const half2 sb01 = *reinterpret_cast<const half2*>(&ssb[s][nt * 16 + (lane % 4) * 2]);
+                const half2 sb23 = *reinterpret_cast<const half2*>(&ssb[s][nt * 16 + (lane % 4) * 2 + 8]);
 
-            // half2 FMA accumulation
-            acc[0][nt][0] = __hfma2(__floats2half2_rn((float)p0[0], (float)p0[1]), s00, acc[0][nt][0]);
-            acc[0][nt][1] = __hfma2(__floats2half2_rn((float)p0[2], (float)p0[3]), s01, acc[0][nt][1]);
-            acc[0][nt][2] = __hfma2(__floats2half2_rn((float)p1[0], (float)p1[1]), s02, acc[0][nt][2]);
-            acc[0][nt][3] = __hfma2(__floats2half2_rn((float)p1[2], (float)p1[3]), s03, acc[0][nt][3]);
+                const half2 s00 = __hmul2(sa0, sb01), s01 = __hmul2(sa1, sb01);
+                const half2 s02 = __hmul2(sa0, sb23), s03 = __hmul2(sa1, sb23);
+                const half2 s10 = __hmul2(sa2, sb01), s11 = __hmul2(sa3, sb01);
+                const half2 s12 = __hmul2(sa2, sb23), s13 = __hmul2(sa3, sb23);
 
-            acc[1][nt][0] = __hfma2(__floats2half2_rn((float)q0[0], (float)q0[1]), s10, acc[1][nt][0]);
-            acc[1][nt][1] = __hfma2(__floats2half2_rn((float)q0[2], (float)q0[3]), s11, acc[1][nt][1]);
-            acc[1][nt][2] = __hfma2(__floats2half2_rn((float)q1[0], (float)q1[1]), s12, acc[1][nt][2]);
-            acc[1][nt][3] = __hfma2(__floats2half2_rn((float)q1[2], (float)q1[3]), s13, acc[1][nt][3]);
+                acc[0][nt][0] = __hfma2(__floats2half2_rn((float)p0[0], (float)p0[1]), s00, acc[0][nt][0]);
+                acc[0][nt][1] = __hfma2(__floats2half2_rn((float)p0[2], (float)p0[3]), s01, acc[0][nt][1]);
+                acc[0][nt][2] = __hfma2(__floats2half2_rn((float)p1[0], (float)p1[1]), s02, acc[0][nt][2]);
+                acc[0][nt][3] = __hfma2(__floats2half2_rn((float)p1[2], (float)p1[3]), s03, acc[0][nt][3]);
+
+                acc[1][nt][0] = __hfma2(__floats2half2_rn((float)q0[0], (float)q0[1]), s10, acc[1][nt][0]);
+                acc[1][nt][1] = __hfma2(__floats2half2_rn((float)q0[2], (float)q0[3]), s11, acc[1][nt][1]);
+                acc[1][nt][2] = __hfma2(__floats2half2_rn((float)q1[0], (float)q1[1]), s12, acc[1][nt][2]);
+                acc[1][nt][3] = __hfma2(__floats2half2_rn((float)q1[2], (float)q1[3]), s13, acc[1][nt][3]);
+            }
+
+            // Prefetch NEXT K-tile's A-fragments
+            if (kt + 1 < nkt) {
+                af0 = A[a_base0 + (size_t)(kt + 1) * a_stride];
+                af1 = A[a_base1 + (size_t)(kt + 1) * a_stride];
+            }
         }
 
-        // Prefetch NEXT K-tile's A-fragments (overlap global loads with sync)
-        if (kt + 1 < nkt) {
-            af0 = A[a_base0 + (size_t)(kt + 1) * a_stride];
-            af1 = A[a_base1 + (size_t)(kt + 1) * a_stride];
-        }
-
-        __syncthreads();  // Single sync: ensures scale buffer swap is safe
+        __syncthreads();  // Ensures B-scale buffer swap is safe
     }
 
     // Epilogue: vectorized half2 stores
@@ -473,12 +480,15 @@ torch::Tensor gemm_int4_custom(
     TORCH_CHECK(A_packed.is_cuda() && B_packed.is_cuda());
     TORCH_CHECK(A_packed.dtype() == torch::kUInt8);
     int M = A_packed.size(0), K = A_packed.size(1) * 2, N = B_packed.size(0);
+    int num_groups_B = scales_B.size(1);
 
     auto C = torch::empty({M, N},
         torch::TensorOptions().dtype(torch::kHalf).device(A_packed.device()));
 
+    int nkt = K / BK;
     bool use_direct = (group_size == BK) &&
-                      (M % BM == 0) && (N % BN == 0) && (K % BK == 0);
+                      (M % BM == 0) && (N % BN == 0) && (K % BK == 0) &&
+                      (nkt % num_groups_B == 0);
 
     if (use_direct) {
         // Cache repacked activations
@@ -494,7 +504,6 @@ torch::Tensor gemm_int4_custom(
             s_wgt_cache.k1 = bk; s_wgt_cache.ok = true;
         }
 
-        int nkt = K / BK;
         gemm_direct_kernel<<<dim3(N / BN, M / BM), WS * NW, 0,
                              at::cuda::getCurrentCUDAStream()>>>(
             reinterpret_cast<const uint4*>(s_act_cache.data.data_ptr<uint8_t>()),
@@ -502,7 +511,7 @@ torch::Tensor gemm_int4_custom(
             reinterpret_cast<const half*>(scales_A.data_ptr<at::Half>()),
             reinterpret_cast<const half*>(scales_B.data_ptr<at::Half>()),
             reinterpret_cast<half*>(C.data_ptr<at::Half>()),
-            M, N, nkt);
+            M, N, nkt, num_groups_B);
         return C;
     }
 

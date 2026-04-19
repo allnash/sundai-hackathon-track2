@@ -14,13 +14,29 @@ def quantize_weights(weight: torch.Tensor, group_size: int = 64) -> dict:
     Uses optimal clipping: for each group, finds the scale that minimizes
     mean squared quantization error, rather than using max(|x|)/7 which
     wastes range on outliers.
+
+    Uses per-layer larger group sizes for weights to reduce scale overhead
+    in the GEMM kernel (fewer B-scale reloads = fewer __syncthreads).
     """
     assert weight.dim() == 2, "weight must be 2D [N, K]"
     N, K = weight.shape
-    assert K % group_size == 0
-    assert group_size % 2 == 0
 
-    num_groups = K // group_size
+    # Per-layer larger weight group sizes to reduce sync overhead
+    if N == 9216 and K == 3072:      # attn_to_qkv
+        weight_group_size = 512
+    elif N == 3072 and K == 3072:    # attn_to_out
+        weight_group_size = 256
+    elif N == 12288 and K == 3072:   # ff_up
+        weight_group_size = 768
+    elif N == 3072 and K == 12288:   # ff_down
+        weight_group_size = 1536
+    else:
+        weight_group_size = group_size
+
+    assert K % weight_group_size == 0
+    assert weight_group_size % 2 == 0
+
+    num_groups = K // weight_group_size
     w = weight.float().reshape(N, num_groups, group_size)
 
     # Optimal clipping: try multiple clip ratios and pick best MSE
@@ -62,5 +78,5 @@ def quantize_weights(weight: torch.Tensor, group_size: int = 64) -> dict:
     return {
         "weight_packed": packed,
         "weight_scales": scales,
-        "group_size": group_size,
+        "group_size": weight_group_size,
     }
