@@ -225,8 +225,7 @@ __global__ void repack_wgt_kernel(
 //   2. A-fragment prefetching → overlap global loads with sync barrier
 //   3. B-fragment prefetching within N-tile loop
 
-__global__ __launch_bounds__(256, 2)
-void gemm_direct_kernel(
+__global__ void gemm_direct_kernel(
     const uint4* __restrict__ A,
     const uint4* __restrict__ B,
     const half*  __restrict__ scales_A,
