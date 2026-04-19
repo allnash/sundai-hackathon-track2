@@ -37,7 +37,7 @@ def quantize_weights(weight: torch.Tensor, group_size: int = 64) -> dict:
     assert weight_group_size % 2 == 0
 
     num_groups = K // weight_group_size
-    w = weight.float().reshape(N, num_groups, group_size)
+    w = weight.float().reshape(N, num_groups, weight_group_size)
 
     # Optimal clipping: try multiple clip ratios and pick best MSE
     max_abs = w.abs().amax(dim=-1, keepdim=True)  # [N, num_groups, 1]
