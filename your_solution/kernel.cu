@@ -83,6 +83,7 @@ std::vector<torch::Tensor> quantize_int4_custom(torch::Tensor input, int group_s
 
 // ======================== GEMM CONSTANTS ========================
 
+// 8-warp config (BM=256)
 static constexpr int BM = 256;          // rows per block
 static constexpr int BN = 128;          // cols per block
 static constexpr int BK = 64;           // K per tile (= group_size)
@@ -91,6 +92,12 @@ static constexpr int NW = 8;            // warps per block
 static constexpr int WM = BM / NW;      // 32 rows per warp
 static constexpr int AT = WM / 16;      // 2 vertical A-tiles per warp
 static constexpr int NT = BN / 16;      // 8 horizontal N-tiles
+
+// 4-warp config (BM=128) — potentially more blocks/SM
+static constexpr int BM4 = 128;
+static constexpr int NW4 = 4;
+static constexpr int WM4 = BM4 / NW4;   // 32 rows per warp
+static constexpr int AT4 = WM4 / 16;    // 2 vertical A-tiles per warp
 
 // ======================== CACHE ========================
 
@@ -215,6 +222,164 @@ __global__ void repack_wgt_kernel(
 
         output[((bn * nkt + kt) * NT + nt) * WS + lane] = frag;
         __syncwarp();
+    }
+}
+
+// ======================== 4-WARP REPACK ========================
+
+__global__ void repack_act_kernel_4w(
+    const uint32_t* __restrict__ input,
+    uint4* __restrict__ output,
+    int K_packs, int nkt)
+{
+    const int lane = threadIdx.x;
+    const int wt = blockIdx.x;
+    const int kt = blockIdx.y;
+    const int bm = wt / NW4;
+    const int warp = wt % NW4;
+    const int row_base = wt * WM4;
+
+    __shared__ alignas(128) uint32_t mat[16][8];
+
+    #pragma unroll
+    for (int tile = 0; tile < AT4; tile++) {
+        const int tr = row_base + tile * 16;
+        #pragma unroll
+        for (int i = 0; i < 4; i++) {
+            int r = i * 4 + lane / 8;
+            int c = lane % 8;
+            mat[r][c] = input[(tr + r) * K_packs + kt * 8 + c];
+        }
+        __syncwarp();
+        uint4 frag;
+        ldmatrix_x4(&mat[lane % 16][(lane / 16) * 4], frag);
+        output[((((bm * nkt + kt) * NW4 + warp) * AT4) + tile) * WS + lane] = frag;
+        __syncwarp();
+    }
+}
+
+// ======================== 4-WARP DIRECT GEMM KERNEL ========================
+
+__global__ void gemm_direct_kernel_4w(
+    const uint4* __restrict__ A,
+    const uint4* __restrict__ B,
+    const half*  __restrict__ scales_A,
+    const half*  __restrict__ scales_B,
+    half*        __restrict__ C,
+    int M, int N, int nkt, int num_groups_B)
+{
+    const int bn = blockIdx.x;
+    const int bm = blockIdx.y;
+    const int tid = threadIdx.x;
+    const int warp = tid / WS;
+    const int lane = tid % WS;
+    const int m_base = bm * BM4 + warp * WM4;
+    const int row = lane / 4;
+
+    __shared__ half ssb[2][BN];
+
+    half2 acc[AT4][NT][4];
+    #pragma unroll
+    for (int a = 0; a < AT4; a++)
+        #pragma unroll
+        for (int j = 0; j < NT; j++) {
+            acc[a][j][0] = __float2half2_rn(0.f);
+            acc[a][j][1] = __float2half2_rn(0.f);
+            acc[a][j][2] = __float2half2_rn(0.f);
+            acc[a][j][3] = __float2half2_rn(0.f);
+        }
+
+    const int a_base0 = (((bm * nkt) * NW4 + warp) * AT4 + 0) * WS + lane;
+    const int a_base1 = (((bm * nkt) * NW4 + warp) * AT4 + 1) * WS + lane;
+    const int a_stride = NW4 * AT4 * WS;
+
+    const int b_base = (bn * nkt) * NT * WS + lane;
+    const int b_stride = NT * WS;
+
+    const int b_scale_stride = nkt / num_groups_B;
+
+    if (tid < BN) ssb[0][tid] = scales_B[(bn * BN + tid) * num_groups_B + 0];
+
+    uint4 af0 = A[a_base0];
+    uint4 af1 = A[a_base1];
+
+    __syncthreads();
+
+    for (int bg = 0; bg < num_groups_B; bg++) {
+        const int s = bg & 1;
+
+        if (bg + 1 < num_groups_B) {
+            if (tid < BN) ssb[s ^ 1][tid] = scales_B[(bn * BN + tid) * num_groups_B + bg + 1];
+        }
+
+        for (int sub = 0; sub < b_scale_stride; sub++) {
+            const int kt = bg * b_scale_stride + sub;
+
+            // A scales via __shfl_sync
+            const half scale_lane = scales_A[(m_base + lane) * nkt + kt];
+            const half sa0_s = __shfl_sync(0xffffffff, scale_lane, row);
+            const half sa1_s = __shfl_sync(0xffffffff, scale_lane, row + 8);
+            const half sa2_s = __shfl_sync(0xffffffff, scale_lane, row + 16);
+            const half sa3_s = __shfl_sync(0xffffffff, scale_lane, row + 24);
+            const half2 sa0 = __halves2half2(sa0_s, sa0_s);
+            const half2 sa1 = __halves2half2(sa1_s, sa1_s);
+            const half2 sa2 = __halves2half2(sa2_s, sa2_s);
+            const half2 sa3 = __halves2half2(sa3_s, sa3_s);
+
+            #pragma unroll
+            for (int nt = 0; nt < NT; nt++) {
+                uint4 bf = B[b_base + (size_t)kt * b_stride + nt * WS];
+
+                int p0[4] = {0,0,0,0}, p1[4] = {0,0,0,0};
+                int q0[4] = {0,0,0,0}, q1[4] = {0,0,0,0};
+                mma_s4(af0, uint2{bf.x, bf.y}, p0);
+                mma_s4(af0, uint2{bf.z, bf.w}, p1);
+                mma_s4(af1, uint2{bf.x, bf.y}, q0);
+                mma_s4(af1, uint2{bf.z, bf.w}, q1);
+
+                const half2 sb01 = *reinterpret_cast<const half2*>(&ssb[s][nt * 16 + (lane % 4) * 2]);
+                const half2 sb23 = *reinterpret_cast<const half2*>(&ssb[s][nt * 16 + (lane % 4) * 2 + 8]);
+
+                const half2 s00 = __hmul2(sa0, sb01), s01 = __hmul2(sa1, sb01);
+                const half2 s02 = __hmul2(sa0, sb23), s03 = __hmul2(sa1, sb23);
+                const half2 s10 = __hmul2(sa2, sb01), s11 = __hmul2(sa3, sb01);
+                const half2 s12 = __hmul2(sa2, sb23), s13 = __hmul2(sa3, sb23);
+
+                acc[0][nt][0] = __hfma2(__floats2half2_rn((float)p0[0], (float)p0[1]), s00, acc[0][nt][0]);
+                acc[0][nt][1] = __hfma2(__floats2half2_rn((float)p0[2], (float)p0[3]), s01, acc[0][nt][1]);
+                acc[0][nt][2] = __hfma2(__floats2half2_rn((float)p1[0], (float)p1[1]), s02, acc[0][nt][2]);
+                acc[0][nt][3] = __hfma2(__floats2half2_rn((float)p1[2], (float)p1[3]), s03, acc[0][nt][3]);
+
+                acc[1][nt][0] = __hfma2(__floats2half2_rn((float)q0[0], (float)q0[1]), s10, acc[1][nt][0]);
+                acc[1][nt][1] = __hfma2(__floats2half2_rn((float)q0[2], (float)q0[3]), s11, acc[1][nt][1]);
+                acc[1][nt][2] = __hfma2(__floats2half2_rn((float)q1[0], (float)q1[1]), s12, acc[1][nt][2]);
+                acc[1][nt][3] = __hfma2(__floats2half2_rn((float)q1[2], (float)q1[3]), s13, acc[1][nt][3]);
+            }
+
+            if (kt + 1 < nkt) {
+                af0 = A[a_base0 + (size_t)(kt + 1) * a_stride];
+                af1 = A[a_base1 + (size_t)(kt + 1) * a_stride];
+            }
+        }
+
+        __syncthreads();
+    }
+
+    const int m0 = m_base + row, m1 = m0 + 8, m2 = m0 + 16, m3 = m0 + 24;
+    #pragma unroll
+    for (int nt = 0; nt < NT; nt++) {
+        const int c0 = bn * BN + nt * 16 + (lane % 4) * 2;
+        const int c2 = c0 + 8;
+
+        *reinterpret_cast<half2*>(&C[m0 * N + c0]) = acc[0][nt][0];
+        *reinterpret_cast<half2*>(&C[m0 * N + c2]) = acc[0][nt][2];
+        *reinterpret_cast<half2*>(&C[m1 * N + c0]) = acc[0][nt][1];
+        *reinterpret_cast<half2*>(&C[m1 * N + c2]) = acc[0][nt][3];
+
+        *reinterpret_cast<half2*>(&C[m2 * N + c0]) = acc[1][nt][0];
+        *reinterpret_cast<half2*>(&C[m2 * N + c2]) = acc[1][nt][2];
+        *reinterpret_cast<half2*>(&C[m3 * N + c0]) = acc[1][nt][1];
+        *reinterpret_cast<half2*>(&C[m3 * N + c2]) = acc[1][nt][3];
     }
 }
 
@@ -455,10 +620,21 @@ __global__ void gemm_fallback_kernel(
 
 // ======================== HOST WRAPPER ========================
 
+static RepCache s_act4_cache;  // 4-warp activation cache
+
 static torch::Tensor do_repack_act(torch::Tensor input, int K) {
     auto out = torch::empty_like(input);
     int nkt = K / BK, kp = K / 8;
     repack_act_kernel<<<dim3(input.size(0) / WM, nkt), WS, 0, at::cuda::getCurrentCUDAStream()>>>(
+        reinterpret_cast<const uint32_t*>(input.data_ptr<uint8_t>()),
+        reinterpret_cast<uint4*>(out.data_ptr<uint8_t>()), kp, nkt);
+    return out;
+}
+
+static torch::Tensor do_repack_act_4w(torch::Tensor input, int K) {
+    auto out = torch::empty_like(input);
+    int nkt = K / BK, kp = K / 8;
+    repack_act_kernel_4w<<<dim3(input.size(0) / WM4, nkt), WS, 0, at::cuda::getCurrentCUDAStream()>>>(
         reinterpret_cast<const uint32_t*>(input.data_ptr<uint8_t>()),
         reinterpret_cast<uint4*>(out.data_ptr<uint8_t>()), kp, nkt);
     return out;
@@ -486,12 +662,43 @@ torch::Tensor gemm_int4_custom(
         torch::TensorOptions().dtype(torch::kHalf).device(A_packed.device()));
 
     int nkt = K / BK;
-    bool use_direct = (group_size == BK) &&
-                      (M % BM == 0) && (N % BN == 0) && (K % BK == 0) &&
-                      (nkt % num_groups_B == 0);
+    bool aligned = (group_size == BK) && (N % BN == 0) && (K % BK == 0) &&
+                   (nkt % num_groups_B == 0);
 
-    if (use_direct) {
-        // Cache repacked activations
+    // Try 4-warp kernel for shapes where it may give higher occupancy
+    bool use_4w = aligned && (M % BM4 == 0) &&
+                  (N == 3072 || K == 3072);
+
+    // Fall back to 8-warp for large M
+    bool use_8w = aligned && (M % BM == 0) && !use_4w;
+
+    if (use_4w) {
+        // Cache repacked activations (4-warp layout)
+        uintptr_t ak = tkey(A_packed), ak2 = tkey(scales_A);
+        if (!s_act4_cache.ok || s_act4_cache.k1 != ak || s_act4_cache.k2 != ak2) {
+            s_act4_cache.data = do_repack_act_4w(A_packed, K);
+            s_act4_cache.k1 = ak; s_act4_cache.k2 = ak2; s_act4_cache.ok = true;
+        }
+        // Cache repacked weights
+        uintptr_t bk = tkey(B_packed);
+        if (!s_wgt_cache.ok || s_wgt_cache.k1 != bk) {
+            s_wgt_cache.data = do_repack_wgt(B_packed, K);
+            s_wgt_cache.k1 = bk; s_wgt_cache.ok = true;
+        }
+
+        gemm_direct_kernel_4w<<<dim3(N / BN, M / BM4), WS * NW4, 0,
+                                at::cuda::getCurrentCUDAStream()>>>(
+            reinterpret_cast<const uint4*>(s_act4_cache.data.data_ptr<uint8_t>()),
+            reinterpret_cast<const uint4*>(s_wgt_cache.data.data_ptr<uint8_t>()),
+            reinterpret_cast<const half*>(scales_A.data_ptr<at::Half>()),
+            reinterpret_cast<const half*>(scales_B.data_ptr<at::Half>()),
+            reinterpret_cast<half*>(C.data_ptr<at::Half>()),
+            M, N, nkt, num_groups_B);
+        return C;
+    }
+
+    if (use_8w) {
+        // Cache repacked activations (8-warp layout)
         uintptr_t ak = tkey(A_packed), ak2 = tkey(scales_A);
         if (!s_act_cache.ok || s_act_cache.k1 != ak || s_act_cache.k2 != ak2) {
             s_act_cache.data = do_repack_act(A_packed, K);
