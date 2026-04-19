@@ -665,9 +665,8 @@ torch::Tensor gemm_int4_custom(
     bool aligned = (group_size == BK) && (N % BN == 0) && (K % BK == 0) &&
                    (nkt % num_groups_B == 0);
 
-    // Try 4-warp kernel for shapes where it may give higher occupancy
-    bool use_4w = aligned && (M % BM4 == 0) &&
-                  (N == 3072 || K == 3072);
+    // Use 4-warp kernel only for small-N shapes (attn_to_out, ff_down)
+    bool use_4w = aligned && (M % BM4 == 0) && (N <= 3072);
 
     // Fall back to 8-warp for large M
     bool use_8w = aligned && (M % BM == 0) && !use_4w;
