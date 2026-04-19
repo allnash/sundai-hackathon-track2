@@ -398,10 +398,18 @@ __global__ void gemm_direct_kernel(
     const half*  __restrict__ scales_A,
     const half*  __restrict__ scales_B,
     half*        __restrict__ C,
-    int M, int N, int nkt, int num_groups_B)
+    int M, int N, int nkt, int num_groups_B,
+    int grid_n, int grid_m)
 {
-    const int bn = blockIdx.x;
-    const int bm = blockIdx.y;
+    // CTA swizzle: process 4×4 block groups for L2 locality
+    const int linear = blockIdx.x + blockIdx.y * gridDim.x;
+    const int SW = 4;
+    const int groups_n = (grid_n + SW - 1) / SW;
+    const int group = linear / (SW * SW);
+    const int local = linear % (SW * SW);
+    const int bn = (group % groups_n) * SW + (local % SW);
+    const int bm = (group / groups_n) * SW + (local / SW);
+    if (bn >= grid_n || bm >= grid_m) return;
     const int tid = threadIdx.x;
     const int warp = tid / WS;
     const int lane = tid % WS;
@@ -710,14 +718,15 @@ torch::Tensor gemm_int4_custom(
             s_wgt_cache.k1 = bk; s_wgt_cache.ok = true;
         }
 
-        gemm_direct_kernel<<<dim3(N / BN, M / BM), WS * NW, 0,
+        int gn = N / BN, gm = M / BM;
+        gemm_direct_kernel<<<dim3(gn, gm), WS * NW, 0,
                              at::cuda::getCurrentCUDAStream()>>>(
             reinterpret_cast<const uint4*>(s_act_cache.data.data_ptr<uint8_t>()),
             reinterpret_cast<const uint4*>(s_wgt_cache.data.data_ptr<uint8_t>()),
             reinterpret_cast<const half*>(scales_A.data_ptr<at::Half>()),
             reinterpret_cast<const half*>(scales_B.data_ptr<at::Half>()),
             reinterpret_cast<half*>(C.data_ptr<at::Half>()),
-            M, N, nkt, num_groups_B);
+            M, N, nkt, num_groups_B, gn, gm);
         return C;
     }
 
