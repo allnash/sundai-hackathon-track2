@@ -27,9 +27,9 @@ def quantize_weights(weight: torch.Tensor, group_size: int = 64) -> dict:
     elif N == 3072 and K == 3072:    # attn_to_out
         weight_group_size = 256
     elif N == 12288 and K == 3072:   # ff_up
-        weight_group_size = 768
-    elif N == 3072 and K == 12288:   # ff_down
         weight_group_size = 1536
+    elif N == 3072 and K == 12288:   # ff_down
+        weight_group_size = 3072
     else:
         weight_group_size = group_size
 
