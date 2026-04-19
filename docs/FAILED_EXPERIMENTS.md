@@ -45,21 +45,61 @@ Three "optimizations" applied simultaneously by an agent.
 The agent added `uint4 cur_a[AT], nxt_a[AT]` (8 extra registers for A-fragment double-buffering) while using `__launch_bounds__(256, 3)` which caps at 85 registers. The v2 kernel already uses 125 registers. Result: **massive register spilling**.
 
 ### Root cause 2: SplitK allocated 192MB workspace
-For ff_down (K=12288), the splitK path allocated `[4, 4096, 3072] float32` = 192MB, launched a second reduction kernel, and used `float acc[2][8][8]` = 128 float registers (vs 64 half2 in v2). The memory allocation + reduction kernel overhead dominated GEMM time. ff_down dropped from 303 → 12.5 TOPs.
+For ff_down (K=12288), the splitK path allocated `[4, 4096, 3072] float32` = 192MB, launched a second reduction kernel, and used `float acc[2][8][8]` = 128 float registers (vs 64 half2 in v2). The memory allocation + reduction kernel overhead dominated GEMM time.
 
 ### Root cause 3: CTA swizzle added overhead
-Extra index computation per block + potentially worse L2 access pattern (the "optimization" assumed a specific access pattern that didn't match reality).
+Extra index computation per block + potentially worse L2 access pattern.
 
-**Lesson**: NEVER apply multiple untested optimizations simultaneously. Each change must be benchmarked independently. Register spilling is the #1 killer — always verify register count before adding __launch_bounds__.
+**Lesson**: NEVER apply multiple untested optimizations simultaneously. Each change must be benchmarked independently. Register spilling is the #1 killer.
+
+## Experiment 6: BM=128 with 8 warps (AT=1)
+**Result: 239 TOPs (was 299) — 20% REGRESSION**
+
+Halved BM to 128, reducing AT from 2 to 1 per warp. Goal: halve accumulator registers → more occupancy.
+
+**Root cause**: Each warp now does 16 MMAs per K-tile instead of 32. The MMA-to-overhead ratio worsened because the overhead (scale loads, dequant) stayed similar while compute halved. Even though occupancy doubled (4 blocks/SM), the total MMA throughput per SM was lower.
+
+**Lesson**: Reducing per-warp compute to increase occupancy is only worth it if the kernel is latency-bound (not compute-bound). At 48% of peak MMA, we're compute-bound.
+
+## Experiment 7: Zero-sync kernel (transposed scales via L1)
+**Result: 102 TOPs (was 299) — 3x REGRESSION**
+
+Removed all shared memory for scales. Transposed scale arrays offline [rows, nkt] → [nkt, rows] for coalesced L1 reads. Read scales directly from global memory.
+
+**Root cause**: Each thread now does 20+ global memory loads per K-tile for scales (4 A-scales + 16 B-scale reads across N-tiles). Even with L1 cache hits (~30 cycle latency), the instruction count overwhelmed the pipeline. Shared memory reads are ~5 cycles, __syncthreads is ~25 cycles. The extra loads cost far more than the sync they eliminated.
+
+**Lesson**: Shared memory is 6× faster than L1 for this access pattern. The __syncthreads overhead is small compared to replacing 20 smem reads with 20 global reads.
+
+## Experiment 8: __launch_bounds__(256, 2) on direct kernel
+**Result: CORRECTNESS FAILURE (cosine 0.69-0.80)**
+
+Added `__launch_bounds__(256, 2)` to tell the compiler to optimize for 2 blocks/SM.
+
+**Root cause**: With max 128 registers (65536/256/2) and ~125 used, the compiler had only 3 spare registers. The constrained allocation changed the instruction schedule and caused computation errors (not just spilling — actual incorrect results).
+
+**Lesson**: Even seemingly safe __launch_bounds__ (just 3 registers over current usage) can cause the compiler to produce incorrect code. Never trust __launch_bounds__ on register-pressure-sensitive kernels.
+
+## Experiment 9: Hoist B-scale reads outside K-tile loop
+**Result: 269 TOPs (was 323) — 17% REGRESSION**
+
+Pre-read all B scale values (sb01_all[8], sb23_all[8]) into register arrays before the K-tile loop, since they're constant within a B-group.
+
+**Root cause**: Added 16 half2 registers (sb01_all + sb23_all). From 125 to ~141 registers → dropped from 2 blocks/SM to 1 block/SM. The occupancy halving destroyed performance.
+
+**Lesson**: The register budget is razor-thin at 125/128. Even 16 extra registers (seemingly small) causes a 2× occupancy drop. Any optimization that adds registers MUST be verified against the 128-register ceiling.
 
 ## Summary: What Works vs What Doesn't
 
 ### Works
 - ldmatrix repacking (57 → 283 TOPs) ✓
 - Double-buffered scales (283 → 297 TOPs) ✓
-- A-fragment prefetching before sync (283 → 297 TOPs) ✓
+- A-fragment prefetching before sync ✓
 - half2 FMA accumulation ✓
 - Vectorized half2 epilogue stores ✓
+- Per-layer weight group sizes (299 → 315 TOPs) ✓
+- __shfl_sync for A scales ✓
+- 4-warp kernel for small-N shapes (315 → 323 TOPs) ✓
+- Optimal clipping in quantize.py ✓
 
 ### Doesn't Work (on this kernel)
 - Increasing BLOCK_K with wrong SMEM_STRIDE ✗
@@ -68,6 +108,11 @@ Extra index computation per block + potentially worse L2 access pattern (the "op
 - B-fragment manual prefetching (compiler already does it) ✗
 - SplitK with huge workspace allocation ✗
 - CTA swizzle (overhead > benefit) ✗
+- Removing shared memory for scales (L1 too slow) ✗
+- Hoisting smem reads into registers (register pressure) ✗
 
-### Rule
-**One change at a time. Benchmark. Keep if score goes UP, revert if DOWN.**
+### Rules
+1. **One change at a time. Benchmark. Keep if score goes UP, revert if DOWN.**
+2. **Register count is the #1 constraint. Stay below 128 or die.**
+3. **Don't try to outsmart the compiler on unrolled loops.**
+4. **Shared memory is much faster than L1 for broadcast patterns.**
