@@ -275,72 +275,85 @@ __global__ void gemm_direct_kernel(
 
     __syncthreads();
 
-    // K-loop with double-buffered scales and prefetched fragments
-    for (int kt = 0; kt < nkt; kt++) {
-        const int s = kt & 1;
-
-        // Prefetch NEXT K-tile's scales into alternate buffer (overlaps with compute)
-        if (kt + 1 < nkt) {
-            if (tid < BM) ssa[s ^ 1][tid] = scales_A[(bm * BM + tid) * nkt + kt + 1];
-            if (tid < BN) ssb[s ^ 1][tid] = scales_B[(bn * BN + tid) * nkt + kt + 1];
+    // K-loop: process 2 K-tiles per iteration for better ILP
+    // The compiler can interleave MMA+scale ops from both tiles
+    for (int kt = 0; kt < nkt; kt += 2) {
+        // Load scales for BOTH K-tiles into the two buffers
+        if (tid < BM) {
+            ssa[0][tid] = scales_A[(bm * BM + tid) * nkt + kt];
+            if (kt + 1 < nkt) ssa[1][tid] = scales_A[(bm * BM + tid) * nkt + kt + 1];
         }
+        if (tid < BN) {
+            ssb[0][tid] = scales_B[(bn * BN + tid) * nkt + kt];
+            if (kt + 1 < nkt) ssb[1][tid] = scales_B[(bn * BN + tid) * nkt + kt + 1];
+        }
+        __syncthreads();
 
-        // Read current scales from shared memory (buffer s)
-        const half2 sa0 = __halves2half2(ssa[s][warp * WM + row],     ssa[s][warp * WM + row]);
-        const half2 sa1 = __halves2half2(ssa[s][warp * WM + row + 8], ssa[s][warp * WM + row + 8]);
-        const half2 sa2 = __halves2half2(ssa[s][warp * WM + row + 16],ssa[s][warp * WM + row + 16]);
-        const half2 sa3 = __halves2half2(ssa[s][warp * WM + row + 24],ssa[s][warp * WM + row + 24]);
+        // ---- Process K-tile 0 ----
+        af0 = A[a_base0 + (size_t)kt * a_stride];
+        af1 = A[a_base1 + (size_t)kt * a_stride];
 
-        // N-tile compute loop with B-fragment prefetching
-        // Load first B fragment ahead of the loop
-        const size_t b_kt_base = b_base + (size_t)kt * b_stride;
-        uint4 bf = B[b_kt_base];
+        half2 sa0 = __halves2half2(ssa[0][warp * WM + row],     ssa[0][warp * WM + row]);
+        half2 sa1 = __halves2half2(ssa[0][warp * WM + row + 8], ssa[0][warp * WM + row + 8]);
+        half2 sa2 = __halves2half2(ssa[0][warp * WM + row + 16],ssa[0][warp * WM + row + 16]);
+        half2 sa3 = __halves2half2(ssa[0][warp * WM + row + 24],ssa[0][warp * WM + row + 24]);
 
         #pragma unroll
         for (int nt = 0; nt < NT; nt++) {
-            // Prefetch NEXT B fragment while computing with current
-            uint4 bf_next;
-            if (nt + 1 < NT) bf_next = B[b_kt_base + (nt + 1) * WS];
-
-            // 4 MMAs
-            int p0[4] = {0,0,0,0}, p1[4] = {0,0,0,0};
-            int q0[4] = {0,0,0,0}, q1[4] = {0,0,0,0};
+            uint4 bf = B[b_base + (size_t)kt * b_stride + nt * WS];
+            int p0[4]={0,0,0,0}, p1[4]={0,0,0,0}, q0[4]={0,0,0,0}, q1[4]={0,0,0,0};
             mma_s4(af0, uint2{bf.x, bf.y}, p0);
             mma_s4(af0, uint2{bf.z, bf.w}, p1);
             mma_s4(af1, uint2{bf.x, bf.y}, q0);
             mma_s4(af1, uint2{bf.z, bf.w}, q1);
-
-            // Weight scales
-            const half2 sb01 = *reinterpret_cast<const half2*>(&ssb[s][nt * 16 + (lane % 4) * 2]);
-            const half2 sb23 = *reinterpret_cast<const half2*>(&ssb[s][nt * 16 + (lane % 4) * 2 + 8]);
-
-            // Scale products
-            const half2 s00 = __hmul2(sa0, sb01), s01 = __hmul2(sa1, sb01);
-            const half2 s02 = __hmul2(sa0, sb23), s03 = __hmul2(sa1, sb23);
-            const half2 s10 = __hmul2(sa2, sb01), s11 = __hmul2(sa3, sb01);
-            const half2 s12 = __hmul2(sa2, sb23), s13 = __hmul2(sa3, sb23);
-
-            // half2 FMA accumulation
-            acc[0][nt][0] = __hfma2(__floats2half2_rn((float)p0[0], (float)p0[1]), s00, acc[0][nt][0]);
-            acc[0][nt][1] = __hfma2(__floats2half2_rn((float)p0[2], (float)p0[3]), s01, acc[0][nt][1]);
-            acc[0][nt][2] = __hfma2(__floats2half2_rn((float)p1[0], (float)p1[1]), s02, acc[0][nt][2]);
-            acc[0][nt][3] = __hfma2(__floats2half2_rn((float)p1[2], (float)p1[3]), s03, acc[0][nt][3]);
-
-            acc[1][nt][0] = __hfma2(__floats2half2_rn((float)q0[0], (float)q0[1]), s10, acc[1][nt][0]);
-            acc[1][nt][1] = __hfma2(__floats2half2_rn((float)q0[2], (float)q0[3]), s11, acc[1][nt][1]);
-            acc[1][nt][2] = __hfma2(__floats2half2_rn((float)q1[0], (float)q1[1]), s12, acc[1][nt][2]);
-            acc[1][nt][3] = __hfma2(__floats2half2_rn((float)q1[2], (float)q1[3]), s13, acc[1][nt][3]);
-
-            bf = bf_next;  // Advance to prefetched fragment
+            const half2 sb01 = *reinterpret_cast<const half2*>(&ssb[0][nt*16 + (lane%4)*2]);
+            const half2 sb23 = *reinterpret_cast<const half2*>(&ssb[0][nt*16 + (lane%4)*2 + 8]);
+            half2 s00=__hmul2(sa0,sb01), s01=__hmul2(sa1,sb01), s02=__hmul2(sa0,sb23), s03=__hmul2(sa1,sb23);
+            half2 s10=__hmul2(sa2,sb01), s11=__hmul2(sa3,sb01), s12=__hmul2(sa2,sb23), s13=__hmul2(sa3,sb23);
+            acc[0][nt][0]=__hfma2(__floats2half2_rn((float)p0[0],(float)p0[1]),s00,acc[0][nt][0]);
+            acc[0][nt][1]=__hfma2(__floats2half2_rn((float)p0[2],(float)p0[3]),s01,acc[0][nt][1]);
+            acc[0][nt][2]=__hfma2(__floats2half2_rn((float)p1[0],(float)p1[1]),s02,acc[0][nt][2]);
+            acc[0][nt][3]=__hfma2(__floats2half2_rn((float)p1[2],(float)p1[3]),s03,acc[0][nt][3]);
+            acc[1][nt][0]=__hfma2(__floats2half2_rn((float)q0[0],(float)q0[1]),s10,acc[1][nt][0]);
+            acc[1][nt][1]=__hfma2(__floats2half2_rn((float)q0[2],(float)q0[3]),s11,acc[1][nt][1]);
+            acc[1][nt][2]=__hfma2(__floats2half2_rn((float)q1[0],(float)q1[1]),s12,acc[1][nt][2]);
+            acc[1][nt][3]=__hfma2(__floats2half2_rn((float)q1[2],(float)q1[3]),s13,acc[1][nt][3]);
         }
 
-        // Prefetch NEXT K-tile's A-fragments (overlap global loads with sync)
+        // ---- Process K-tile 1 (if exists) ----
         if (kt + 1 < nkt) {
-            af0 = A[a_base0 + (size_t)(kt + 1) * a_stride];
-            af1 = A[a_base1 + (size_t)(kt + 1) * a_stride];
+            af0 = A[a_base0 + (size_t)(kt+1) * a_stride];
+            af1 = A[a_base1 + (size_t)(kt+1) * a_stride];
+
+            sa0 = __halves2half2(ssa[1][warp * WM + row],     ssa[1][warp * WM + row]);
+            sa1 = __halves2half2(ssa[1][warp * WM + row + 8], ssa[1][warp * WM + row + 8]);
+            sa2 = __halves2half2(ssa[1][warp * WM + row + 16],ssa[1][warp * WM + row + 16]);
+            sa3 = __halves2half2(ssa[1][warp * WM + row + 24],ssa[1][warp * WM + row + 24]);
+
+            #pragma unroll
+            for (int nt = 0; nt < NT; nt++) {
+                uint4 bf = B[b_base + (size_t)(kt+1) * b_stride + nt * WS];
+                int p0[4]={0,0,0,0}, p1[4]={0,0,0,0}, q0[4]={0,0,0,0}, q1[4]={0,0,0,0};
+                mma_s4(af0, uint2{bf.x, bf.y}, p0);
+                mma_s4(af0, uint2{bf.z, bf.w}, p1);
+                mma_s4(af1, uint2{bf.x, bf.y}, q0);
+                mma_s4(af1, uint2{bf.z, bf.w}, q1);
+                const half2 sb01 = *reinterpret_cast<const half2*>(&ssb[1][nt*16 + (lane%4)*2]);
+                const half2 sb23 = *reinterpret_cast<const half2*>(&ssb[1][nt*16 + (lane%4)*2 + 8]);
+                half2 s00=__hmul2(sa0,sb01), s01=__hmul2(sa1,sb01), s02=__hmul2(sa0,sb23), s03=__hmul2(sa1,sb23);
+                half2 s10=__hmul2(sa2,sb01), s11=__hmul2(sa3,sb01), s12=__hmul2(sa2,sb23), s13=__hmul2(sa3,sb23);
+                acc[0][nt][0]=__hfma2(__floats2half2_rn((float)p0[0],(float)p0[1]),s00,acc[0][nt][0]);
+                acc[0][nt][1]=__hfma2(__floats2half2_rn((float)p0[2],(float)p0[3]),s01,acc[0][nt][1]);
+                acc[0][nt][2]=__hfma2(__floats2half2_rn((float)p1[0],(float)p1[1]),s02,acc[0][nt][2]);
+                acc[0][nt][3]=__hfma2(__floats2half2_rn((float)p1[2],(float)p1[3]),s03,acc[0][nt][3]);
+                acc[1][nt][0]=__hfma2(__floats2half2_rn((float)q0[0],(float)q0[1]),s10,acc[1][nt][0]);
+                acc[1][nt][1]=__hfma2(__floats2half2_rn((float)q0[2],(float)q0[3]),s11,acc[1][nt][1]);
+                acc[1][nt][2]=__hfma2(__floats2half2_rn((float)q1[0],(float)q1[1]),s12,acc[1][nt][2]);
+                acc[1][nt][3]=__hfma2(__floats2half2_rn((float)q1[2],(float)q1[3]),s13,acc[1][nt][3]);
+            }
         }
 
-        __syncthreads();  // Single sync: ensures scale buffer swap is safe
+        __syncthreads();  // 1 sync per 2 K-tiles
     }
 
     // Epilogue: vectorized half2 stores
