@@ -218,10 +218,13 @@ __global__ void repack_wgt_kernel(
     }
 }
 
-// ======================== DIRECT GEMM KERNEL ========================
+// ======================== DIRECT GEMM KERNEL v2 ========================
+//
+// Optimizations over v1:
+//   1. Double-buffered scales → 1 __syncthreads per K-tile (was 2)
+//   2. A-fragment prefetching → overlap global loads with sync barrier
+//   3. B-fragment prefetching within N-tile loop
 
-// Loads pre-repacked fragments from global memory (1 uint4 load per fragment).
-// Only shared memory used is for scales (~768 bytes).
 __global__ void gemm_direct_kernel(
     const uint4* __restrict__ A,
     const uint4* __restrict__ B,
@@ -236,12 +239,13 @@ __global__ void gemm_direct_kernel(
     const int warp = tid / WS;
     const int lane = tid % WS;
     const int m_base = bm * BM + warp * WM;
+    const int row = lane / 4;
 
-    // Tiny shared memory: scales only
-    __shared__ half ssa[BM];   // 512 bytes
-    __shared__ half ssb[BN];   // 256 bytes
+    // Double-buffered scales in shared memory (~1.5KB total)
+    __shared__ half ssa[2][BM];
+    __shared__ half ssb[2][BN];
 
-    // half2 accumulators: [2 A-tiles][8 N-tiles][4 values]
+    // half2 accumulators
     half2 acc[AT][NT][4];
     #pragma unroll
     for (int a = 0; a < AT; a++)
@@ -253,48 +257,65 @@ __global__ void gemm_direct_kernel(
             acc[a][j][3] = __float2half2_rn(0.f);
         }
 
-    // K-loop
+    // Precompute A-fragment base addresses for this warp
+    const int a_base0 = (((bm * nkt) * NW + warp) * AT + 0) * WS + lane;
+    const int a_base1 = (((bm * nkt) * NW + warp) * AT + 1) * WS + lane;
+    const int a_stride = NW * AT * WS;  // stride per K-tile
+
+    const int b_base = (bn * nkt) * NT * WS + lane;
+    const int b_stride = NT * WS;  // stride per K-tile
+
+    // Prefetch first K-tile's scales
+    if (tid < BM) ssa[0][tid] = scales_A[(bm * BM + tid) * nkt + 0];
+    if (tid < BN) ssb[0][tid] = scales_B[(bn * BN + tid) * nkt + 0];
+
+    // Prefetch first K-tile's A-fragments (overlap with scale sync)
+    uint4 af0 = A[a_base0];
+    uint4 af1 = A[a_base1];
+
+    __syncthreads();
+
+    // K-loop with double-buffered scales and prefetched fragments
     for (int kt = 0; kt < nkt; kt++) {
-        // Cooperative scale load into shared memory
-        if (tid < BM) ssa[tid] = scales_A[(bm * BM + tid) * nkt + kt];
-        if (tid < BN) ssb[tid] = scales_B[(bn * BN + tid) * nkt + kt];
-        __syncthreads();
+        const int s = kt & 1;
 
-        // Load pre-repacked A fragments (2 vertical tiles)
-        uint4 af0 = A[((((bm * nkt + kt) * NW + warp) * AT) + 0) * WS + lane];
-        uint4 af1 = A[((((bm * nkt + kt) * NW + warp) * AT) + 1) * WS + lane];
+        // Prefetch NEXT K-tile's scales into alternate buffer (overlaps with compute)
+        if (kt + 1 < nkt) {
+            if (tid < BM) ssa[s ^ 1][tid] = scales_A[(bm * BM + tid) * nkt + kt + 1];
+            if (tid < BN) ssb[s ^ 1][tid] = scales_B[(bn * BN + tid) * nkt + kt + 1];
+        }
 
-        // Activation scales for this warp's 32 rows
-        const int row = lane / 4;
-        const half2 sa0 = __halves2half2(ssa[warp * WM + row],     ssa[warp * WM + row]);
-        const half2 sa1 = __halves2half2(ssa[warp * WM + row + 8], ssa[warp * WM + row + 8]);
-        const half2 sa2 = __halves2half2(ssa[warp * WM + row + 16],ssa[warp * WM + row + 16]);
-        const half2 sa3 = __halves2half2(ssa[warp * WM + row + 24],ssa[warp * WM + row + 24]);
+        // Read current scales from shared memory (buffer s)
+        const half2 sa0 = __halves2half2(ssa[s][warp * WM + row],     ssa[s][warp * WM + row]);
+        const half2 sa1 = __halves2half2(ssa[s][warp * WM + row + 8], ssa[s][warp * WM + row + 8]);
+        const half2 sa2 = __halves2half2(ssa[s][warp * WM + row + 16],ssa[s][warp * WM + row + 16]);
+        const half2 sa3 = __halves2half2(ssa[s][warp * WM + row + 24],ssa[s][warp * WM + row + 24]);
 
+        // N-tile compute loop (A-fragments already in registers from prefetch)
         #pragma unroll
         for (int nt = 0; nt < NT; nt++) {
-            // Load pre-repacked B fragment (contains 2 uint2 sub-fragments)
-            uint4 bf = B[((bn * nkt + kt) * NT + nt) * WS + lane];
+            // Load B fragment
+            uint4 bf = B[b_base + (size_t)kt * b_stride + nt * WS];
 
-            // 4 MMAs: 2 A-tiles × 2 B-halves
+            // 4 MMAs
             int p0[4] = {0,0,0,0}, p1[4] = {0,0,0,0};
             int q0[4] = {0,0,0,0}, q1[4] = {0,0,0,0};
-            mma_s4(af0, uint2{bf.x, bf.y}, p0);   // A-tile 0, B cols 0-7
-            mma_s4(af0, uint2{bf.z, bf.w}, p1);   // A-tile 0, B cols 8-15
-            mma_s4(af1, uint2{bf.x, bf.y}, q0);   // A-tile 1, B cols 0-7
-            mma_s4(af1, uint2{bf.z, bf.w}, q1);   // A-tile 1, B cols 8-15
+            mma_s4(af0, uint2{bf.x, bf.y}, p0);
+            mma_s4(af0, uint2{bf.z, bf.w}, p1);
+            mma_s4(af1, uint2{bf.x, bf.y}, q0);
+            mma_s4(af1, uint2{bf.z, bf.w}, q1);
 
-            // Weight scales (half2 load from shared memory)
-            const half2 sb01 = *reinterpret_cast<const half2*>(&ssb[nt * 16 + (lane % 4) * 2]);
-            const half2 sb23 = *reinterpret_cast<const half2*>(&ssb[nt * 16 + (lane % 4) * 2 + 8]);
+            // Weight scales
+            const half2 sb01 = *reinterpret_cast<const half2*>(&ssb[s][nt * 16 + (lane % 4) * 2]);
+            const half2 sb23 = *reinterpret_cast<const half2*>(&ssb[s][nt * 16 + (lane % 4) * 2 + 8]);
 
-            // Scale products: sa × sb
+            // Scale products
             const half2 s00 = __hmul2(sa0, sb01), s01 = __hmul2(sa1, sb01);
             const half2 s02 = __hmul2(sa0, sb23), s03 = __hmul2(sa1, sb23);
             const half2 s10 = __hmul2(sa2, sb01), s11 = __hmul2(sa3, sb01);
             const half2 s12 = __hmul2(sa2, sb23), s13 = __hmul2(sa3, sb23);
 
-            // half2 FMA accumulation: convert INT32 MMA results to half2, scale, accumulate
+            // half2 FMA accumulation
             acc[0][nt][0] = __hfma2(__floats2half2_rn((float)p0[0], (float)p0[1]), s00, acc[0][nt][0]);
             acc[0][nt][1] = __hfma2(__floats2half2_rn((float)p0[2], (float)p0[3]), s01, acc[0][nt][1]);
             acc[0][nt][2] = __hfma2(__floats2half2_rn((float)p1[0], (float)p1[1]), s02, acc[0][nt][2]);
@@ -305,12 +326,18 @@ __global__ void gemm_direct_kernel(
             acc[1][nt][2] = __hfma2(__floats2half2_rn((float)q1[0], (float)q1[1]), s12, acc[1][nt][2]);
             acc[1][nt][3] = __hfma2(__floats2half2_rn((float)q1[2], (float)q1[3]), s13, acc[1][nt][3]);
         }
-        __syncthreads();
+
+        // Prefetch NEXT K-tile's A-fragments (overlap global loads with sync)
+        if (kt + 1 < nkt) {
+            af0 = A[a_base0 + (size_t)(kt + 1) * a_stride];
+            af1 = A[a_base1 + (size_t)(kt + 1) * a_stride];
+        }
+
+        __syncthreads();  // Single sync: ensures scale buffer swap is safe
     }
 
     // Epilogue: vectorized half2 stores
-    const int r = lane / 4;
-    const int m0 = m_base + r, m1 = m0 + 8, m2 = m0 + 16, m3 = m0 + 24;
+    const int m0 = m_base + row, m1 = m0 + 8, m2 = m0 + 16, m3 = m0 + 24;
     #pragma unroll
     for (int nt = 0; nt < NT; nt++) {
         const int c0 = bn * BN + nt * 16 + (lane % 4) * 2;
