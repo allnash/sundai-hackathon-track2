@@ -99,7 +99,7 @@ struct RepCache {
     torch::Tensor data;
     bool ok = false;
 };
-static RepCache s_act_cache, s_wgt_cache, s_sat_cache, s_sbt_cache;
+static RepCache s_act_cache, s_wgt_cache;
 
 static uintptr_t tkey(const torch::Tensor& t) {
     return reinterpret_cast<uintptr_t>(t.data_ptr()) ^
@@ -218,19 +218,18 @@ __global__ void repack_wgt_kernel(
     }
 }
 
-// ======================== DIRECT GEMM KERNEL v3 ========================
+// ======================== DIRECT GEMM KERNEL v2 ========================
 //
-// Key change: ZERO __syncthreads!
-//   - Scales read directly from global memory via L1 cache
-//   - Scale tensors are transposed offline: [rows, nkt] → [nkt, rows]
-//   - Enables coalesced half2 reads for B scales
-//   - Each warp runs fully independently — no inter-warp synchronization
+// Optimizations over v1:
+//   1. Double-buffered scales → 1 __syncthreads per K-tile (was 2)
+//   2. A-fragment prefetching → overlap global loads with sync barrier
+//   3. B-fragment prefetching within N-tile loop
 
 __global__ void gemm_direct_kernel(
     const uint4* __restrict__ A,
     const uint4* __restrict__ B,
-    const half*  __restrict__ scales_A_t,  // [nkt, M] — transposed
-    const half*  __restrict__ scales_B_t,  // [nkt, N] — transposed
+    const half*  __restrict__ scales_A,
+    const half*  __restrict__ scales_B,
     half*        __restrict__ C,
     int M, int N, int nkt)
 {
@@ -241,6 +240,10 @@ __global__ void gemm_direct_kernel(
     const int lane = tid % WS;
     const int m_base = bm * BM + warp * WM;
     const int row = lane / 4;
+
+    // Double-buffered scales in shared memory (~1.5KB total)
+    __shared__ half ssa[2][BM];
+    __shared__ half ssb[2][BN];
 
     // half2 accumulators
     half2 acc[AT][NT][4];
@@ -257,36 +260,44 @@ __global__ void gemm_direct_kernel(
     // Precompute A-fragment base addresses for this warp
     const int a_base0 = (((bm * nkt) * NW + warp) * AT + 0) * WS + lane;
     const int a_base1 = (((bm * nkt) * NW + warp) * AT + 1) * WS + lane;
-    const int a_stride = NW * AT * WS;
+    const int a_stride = NW * AT * WS;  // stride per K-tile
 
     const int b_base = (bn * nkt) * NT * WS + lane;
-    const int b_stride = NT * WS;
+    const int b_stride = NT * WS;  // stride per K-tile
 
-    // Scale base addresses
-    const int sa_row = m_base + row;  // this thread's A-scale rows
-    const int sb_col_base = bn * BN;
+    // Prefetch first K-tile's scales
+    if (tid < BM) ssa[0][tid] = scales_A[(bm * BM + tid) * nkt + 0];
+    if (tid < BN) ssb[0][tid] = scales_B[(bn * BN + tid) * nkt + 0];
 
-    // Prefetch first K-tile's A-fragments
+    // Prefetch first K-tile's A-fragments (overlap with scale sync)
     uint4 af0 = A[a_base0];
     uint4 af1 = A[a_base1];
 
-    // K-loop — NO __syncthreads needed!
+    __syncthreads();
+
+    // K-loop with double-buffered scales and prefetched fragments
     for (int kt = 0; kt < nkt; kt++) {
-        // Read A scales directly from global memory (L1 cached, coalesced)
-        const half* sa_ptr = scales_A_t + (size_t)kt * M + sa_row;
-        const half2 sa0 = __half2half2(sa_ptr[0]);
-        const half2 sa1 = __half2half2(sa_ptr[8]);
-        const half2 sa2 = __half2half2(sa_ptr[16]);
-        const half2 sa3 = __half2half2(sa_ptr[24]);
+        const int s = kt & 1;
 
-        // B scale row for this K-tile (contiguous in memory)
-        const half* sb_ptr = scales_B_t + (size_t)kt * N + sb_col_base;
+        // Prefetch NEXT K-tile's scales into alternate buffer (overlaps with compute)
+        if (kt + 1 < nkt) {
+            if (tid < BM) ssa[s ^ 1][tid] = scales_A[(bm * BM + tid) * nkt + kt + 1];
+            if (tid < BN) ssb[s ^ 1][tid] = scales_B[(bn * BN + tid) * nkt + kt + 1];
+        }
 
-        // N-tile compute loop
+        // Read current scales from shared memory (buffer s)
+        const half2 sa0 = __halves2half2(ssa[s][warp * WM + row],     ssa[s][warp * WM + row]);
+        const half2 sa1 = __halves2half2(ssa[s][warp * WM + row + 8], ssa[s][warp * WM + row + 8]);
+        const half2 sa2 = __halves2half2(ssa[s][warp * WM + row + 16],ssa[s][warp * WM + row + 16]);
+        const half2 sa3 = __halves2half2(ssa[s][warp * WM + row + 24],ssa[s][warp * WM + row + 24]);
+
+        // N-tile compute loop (A-fragments already in registers from prefetch)
         #pragma unroll
         for (int nt = 0; nt < NT; nt++) {
+            // Load B fragment
             uint4 bf = B[b_base + (size_t)kt * b_stride + nt * WS];
 
+            // 4 MMAs
             int p0[4] = {0,0,0,0}, p1[4] = {0,0,0,0};
             int q0[4] = {0,0,0,0}, q1[4] = {0,0,0,0};
             mma_s4(af0, uint2{bf.x, bf.y}, p0);
@@ -294,9 +305,9 @@ __global__ void gemm_direct_kernel(
             mma_s4(af1, uint2{bf.x, bf.y}, q0);
             mma_s4(af1, uint2{bf.z, bf.w}, q1);
 
-            // B scales: half2 load from contiguous transposed layout
-            const half2 sb01 = *reinterpret_cast<const half2*>(&sb_ptr[nt * 16 + (lane % 4) * 2]);
-            const half2 sb23 = *reinterpret_cast<const half2*>(&sb_ptr[nt * 16 + (lane % 4) * 2 + 8]);
+            // Weight scales
+            const half2 sb01 = *reinterpret_cast<const half2*>(&ssb[s][nt * 16 + (lane % 4) * 2]);
+            const half2 sb23 = *reinterpret_cast<const half2*>(&ssb[s][nt * 16 + (lane % 4) * 2 + 8]);
 
             // Scale products
             const half2 s00 = __hmul2(sa0, sb01), s01 = __hmul2(sa1, sb01);
@@ -316,11 +327,13 @@ __global__ void gemm_direct_kernel(
             acc[1][nt][3] = __hfma2(__floats2half2_rn((float)q1[2], (float)q1[3]), s13, acc[1][nt][3]);
         }
 
-        // Prefetch NEXT K-tile's A-fragments
+        // Prefetch NEXT K-tile's A-fragments (overlap global loads with sync)
         if (kt + 1 < nkt) {
             af0 = A[a_base0 + (size_t)(kt + 1) * a_stride];
             af1 = A[a_base1 + (size_t)(kt + 1) * a_stride];
         }
+
+        __syncthreads();  // Single sync: ensures scale buffer swap is safe
     }
 
     // Epilogue: vectorized half2 stores
@@ -480,25 +493,14 @@ torch::Tensor gemm_int4_custom(
             s_wgt_cache.data = do_repack_wgt(B_packed, K);
             s_wgt_cache.k1 = bk; s_wgt_cache.ok = true;
         }
-        // Cache transposed scales: [rows, nkt] → [nkt, rows] for coalesced L1 reads
-        uintptr_t sak = tkey(scales_A);
-        if (!s_sat_cache.ok || s_sat_cache.k1 != sak) {
-            s_sat_cache.data = scales_A.t().contiguous();
-            s_sat_cache.k1 = sak; s_sat_cache.ok = true;
-        }
-        uintptr_t sbk = tkey(scales_B);
-        if (!s_sbt_cache.ok || s_sbt_cache.k1 != sbk) {
-            s_sbt_cache.data = scales_B.t().contiguous();
-            s_sbt_cache.k1 = sbk; s_sbt_cache.ok = true;
-        }
 
         int nkt = K / BK;
         gemm_direct_kernel<<<dim3(N / BN, M / BM), WS * NW, 0,
                              at::cuda::getCurrentCUDAStream()>>>(
             reinterpret_cast<const uint4*>(s_act_cache.data.data_ptr<uint8_t>()),
             reinterpret_cast<const uint4*>(s_wgt_cache.data.data_ptr<uint8_t>()),
-            reinterpret_cast<const half*>(s_sat_cache.data.data_ptr<at::Half>()),
-            reinterpret_cast<const half*>(s_sbt_cache.data.data_ptr<at::Half>()),
+            reinterpret_cast<const half*>(scales_A.data_ptr<at::Half>()),
+            reinterpret_cast<const half*>(scales_B.data_ptr<at::Half>()),
             reinterpret_cast<half*>(C.data_ptr<at::Half>()),
             M, N, nkt);
         return C;
